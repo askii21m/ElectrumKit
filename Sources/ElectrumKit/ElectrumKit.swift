@@ -1,10 +1,13 @@
 import Foundation
 import CryptoKit
+import Security
 import Network
 
 #if DEBUG
 import os.log
 #endif
+
+// MARK: - Constants
 
 /// A single ASCII newline byte (`\n`) used to terminate packets
 ///
@@ -26,75 +29,177 @@ fileprivate let terminators: Set<Data> = [
     Data([0x5D, 0x0A])
 ]
 
+// MARK: - ElectrumError
+
 /// Errors thrown by the Electrum client
 public enum ElectrumError: Error, Equatable {
+    
     /// The network connection was closed before the request could complete
     case connectionClosed
-    /// The request exceeded the configured timeout
+    
+    /// The request exceeded the configured timeout interval
     case requestTimeout
+    
     /// The client has reached its configured concurrent request limit
     case requestLimit
-    /// The request could not be encoded
+    
+    /// The request could not be encoded to JSON
     case requestNoncodable
-    /// The response was invalid, with no decodable error
+    
+    /// The response was invalid and contained no decodable error information
     case responseInvalid
-    /// The response had a JSON-RPC error
+    
+    /// The response contained a JSON-RPC error
+    ///
+    /// - Parameters:
+    ///   - code: The error code returned by the server.
+    ///   - message: A descriptive error message.
     case responseError(code: Int, message: String)
-    /// An unknown error occurred
-    case unknown
 }
+
+// MARK: - ElectrumConfig
 
 /// Electrum client configuration
 public struct ElectrumConfig {
-    /// Keychain service for persisting pinned certificates and CA trust markers
-    public let certPath: String
-    /// Maximum number of outstanding requests the client will allow
-    public let requestLimit: Int
-    /// Minimum size before flushing the send buffer
+    
+    /// The time interval in seconds between keepalive ping messages
     ///
-    /// The client will pad RPC payloads up to the next power of
-    /// two that is greater than or equal to `packetMinSize`.
+    /// The client uses ping messages to prevent idle timeouts.
+    public let pingInterval: TimeInterval
+    
+    /// The maximum number of concurrent requests allowed
+    ///
+    /// When this limit is reached, new requests will fail with ``ElectrumError/requestLimit``.
+    public let requestLimit: Int
+    
+    /// The minimum packet size in bytes before flushing the send buffer
+    ///
+    /// The client pads RPC payloads up to the next power of two that is greater than
+    /// or equal to this value. This helps protect against some traffic analysis attacks.
     public let packetMinSize: Int
-    /// Minimum amount of time to wait before flushing the send buffer
+    
+    /// The minimum time interval to wait before flushing the send buffer.
+    ///
+    /// Small packets will be buffered until this interval elapses or ``ElectrumConfig/packetMinSize``
+    /// is exceeded, unless ``ElectrumConfig/packetForceSend`` is enabled.
     public let packetMinWait: TimeInterval
-    /// Force immediate sends, regardless of `packetMinSize` and `packetMinWait`
+    
+    /// A Boolean value that determines whether to bypass buffering and send immediately
+    ///
+    /// When `true`, all packets are sent immediately regardless of ``ElectrumConfig/packetMinSize``.
+    /// and ``ElectrumConfig/packetMinWait`` settings.
     public let packetForceSend: Bool
-    /// Minimum TLS protocol version to allow
+    
+    /// The minimum TLS protocol version to accept
     ///
     /// - Important: TLS versions lower than TLS 1.2 are deprecated and should
     ///              not be used. Use `.TLSv12` or higher.
     public let tlsMinVersion: tls_protocol_version_t
+    
+    /// The keychain service identifier for persisting TLS certificates and trust markers
+    public let tlsCertPath: String
+    
+    /// The initial delay in seconds before attempting the first reconnection
+    ///
+    /// This delay is used as the base for exponential backoff calculations.
+    public let reconnectDelay: TimeInterval
+    
+    /// The maximum delay in seconds between reconnection attempts
+    ///
+    /// Prevents exponential backoff from growing indefinitely.
+    public let reconnectMaxDelay: TimeInterval
+    
+    /// The multiplier applied to the delay after each failed reconnection attempt
+    ///
+    /// Each successive reconnection delay is multiplied by this value, creating
+    /// exponential backoff behavior.
+    public let reconnectMultiplier: Double
+    
+    /// The random jitter factor applied to reconnection delays
+    ///
+    /// A random value between `-reconnectJitter` and `+reconnectJitter`
+    /// (as a fraction of the delay) is added to each reconnection delay to prevent
+    ///  thundering herd problems.
+    public let reconnectJitter: Double
    
+    /// Creates a new Electrum client configuration.
+    ///
+    /// - Parameters:
+    ///   - pingInterval: The interval between ping messages. Defaults to `30.0` seconds
+    ///   - requestLimit: The maximum number of concurrent requests. Defaults to `100`
+    ///   - packetMinSize: The minimum packet size in bytes. Defaults to `1024`
+    ///   - packetForceSend: Whether to force immediate sends. Defaults to `false`
+    ///   - packetMinWait: The minimum wait time before flushing. Defaults to `1.0` second
+    ///   - tlsMinVersion: The minimum TLS version. Defaults to `.TLSv12`
+    ///   - tlsCertPath: The keychain service path. Defaults to `"electrum.client.certificates"`
+    ///   - reconnectDelay: The initial reconnection delay. Defaults to `1.0` second
+    ///   - reconnectMaxDelay: The maximum reconnection delay. Defaults to `60.0` seconds
+    ///   - reconnectMultiplier: The exponential backoff multiplier. Defaults to `2.0`
+    ///   - reconnectJitter: The jitter factor. Defaults to `0.1`
     public init(
-        certPath: String = "electrum.client.certificates",
+        pingInterval: TimeInterval = 30.0,
         requestLimit: Int = 100,
         packetMinSize: Int = 1024,
-        packetMinWait: TimeInterval = 1.0,
         packetForceSend: Bool = false,
-        tlsMinVersion: tls_protocol_version_t = .TLSv12
+        packetMinWait: TimeInterval = 1.0,
+        tlsMinVersion: tls_protocol_version_t = .TLSv12,
+        tlsCertPath: String = "electrum.client.certificates",
+        reconnectDelay: TimeInterval = 1.0,
+        reconnectMaxDelay: TimeInterval = 60.0,
+        reconnectMultiplier: Double = 2.0,
+        reconnectJitter: Double = 0.1
     ) {
-        self.certPath = certPath
+        self.pingInterval = pingInterval
         self.requestLimit = requestLimit
+        
         self.packetMinSize = packetMinSize
         self.packetMinWait = packetMinWait
         self.packetForceSend = packetForceSend
+        
         self.tlsMinVersion = tlsMinVersion
+        self.tlsCertPath = tlsCertPath
+        
+        self.reconnectDelay = reconnectDelay
+        self.reconnectMaxDelay = reconnectMaxDelay
+        self.reconnectMultiplier = reconnectMultiplier
+        self.reconnectJitter = reconnectJitter
     }
 }
 
-/// A type-erased wrapper for encoding and decoding values
+// MARK: - AnyCodable
+
+/// A type-erased wrapper for encoding and decoding heterogeneous JSON values.
 ///
-/// Supported types:
+/// This type supports the following JSON value types:
 /// - Primitives: `Int`, `Double`, `String`, `Bool`
 /// - Collections: `Array`, `Dictionary`
 /// - Null values: `NSNull`
 struct AnyCodable: Codable {
+    
+    /// The underlying value
     let value: Any
     
+    /// Creates a type-erased codable wrapper around the given value
+    ///
+    /// - Parameter value: The value to wrap
     init(_ value: Any) {
         self.value = value
     }
     
+    /// Decodes a value from a single value container
+    ///
+    /// - Parameter decoder: The decoder to read data from
+    /// - Throws: `DecodingError.dataCorruptedError` if the value is not one of the
+    ///         supported types
+    ///
+    /// This function decodes the single value container based on its runtime type:
+    /// 1. Integer values
+    /// 2. Floating-point values
+    /// 3. String values
+    /// 4. Boolean values
+    /// 5. Array values (recursively decoded as `[AnyCodable]`)
+    /// 6. Dictionary values (recursively decoded as `[String: AnyCodable]`)
+    /// 7. Null values
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         if let int = try? container.decode(Int.self) {
@@ -119,6 +224,20 @@ struct AnyCodable: Codable {
         }
     }
     
+    /// Encodes the wrapped value to a single value container
+    ///
+    /// - Parameter encoder: The encoder to write data to
+    /// - Throws: `EncodingError.invalidValue` if the value is not one of the
+    ///         supported types
+    ///
+    /// This function encodes the wrapped value based on its runtime type:
+    /// 1. Integer values (`Int`)
+    /// 2. Floating-point values (`Double`)
+    /// 3. String values (`String`)
+    /// 4. Boolean values (`Bool`)
+    /// 5. Array values (recursively encoded as `[AnyCodable]`)
+    /// 6. Dictionary values (recursively encoded as `[String: AnyCodable]`)
+    /// 7. Null values (`NSNull`)
     func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
         switch value {
@@ -145,12 +264,29 @@ struct AnyCodable: Codable {
     }
 }
 
-/// An encodable JSON-RPC request
+// MARK: - JSON-RPC Types
+
+/// An encodable JSON-RPC 2.0 request
 struct RPCRequest: Encodable {
+    
+    /// This property is always `"2.0"` to comply with JSON-RPC 2.0 specification.
+    let jsonrpc: String = "2.0"
+    
+    /// The name of the remote method to invoke
     let method: String
+    
+    /// The parameters to pass to the remote method
     let params: AnyCodable
+    
+    /// A unique identifier for this request
     let id: Int
 
+    /// Creates a new JSON-RPC request.
+    ///
+    /// - Parameters:
+    ///   - method: The method name
+    ///   - params: The method parameters as an array
+    ///   - id: The request identifier
     init(method: String, params: [Any], id: Int) {
         self.method = method
         self.params = AnyCodable(params)
@@ -158,77 +294,189 @@ struct RPCRequest: Encodable {
     }
 }
 
-/// An encodable JSON-RPC response
-struct RPCResponse: Codable {
+/// A decodable JSON-RPC 2.0 response
+struct RPCResponse: Decodable {
+    
+    /// The JSON-RPC protocol version identifier
+    let jsonrpc: String?
+    
+    /// The result of the remote method invocation, if successful
     let result: AnyCodable?
+    
+    /// The error that occurred, if the invocation failed
     let error: RPCError?
+    
+    /// The identifier matching the original request
     let id: Int?
 }
 
-/// An encodable JSON-RPC error
-struct RPCError: Codable {
-    let code: Int
-    let message: String
-    let data: AnyCodable?
+/// A decodeable JSON-RPC 2.0 Notification
+struct RPCNotificaton: Decodable {
+    
+    /// The JSON-RPC protocol version identifier
+    let jsonrpc: String?
+    
+    /// The notification method
+    let method: String
+    
+    /// The parameters included with the notification
+    ///
+    /// In the `Electrum` protocol, notifications follow a specific structure
+    /// where the subscription parameters are followed by the notification data
+    let params: AnyCodable
 }
 
-/// Lightweight Electrum client
+/// A decodable JSON-RPC 2.0 error object
+struct RPCError: Decodable {
+    
+    /// A numeric error code
+    let code: Int
+    
+    /// A human-readable error message
+   let message: String
+   
+   /// Additional error data, if provided
+   let data: AnyCodable?
+}
+
+// MARK: - ElectrumClient
+
+/// A lightweight client for Electrum servers
 ///
-/// This class manages a single `NWConnection` to an Electrum-compatible server,
-/// supports simple request/response interactions and persistent subscriptions.
+/// `ElectrumClient` manages a single network connection to an Electrum server using
+/// the Network framework. It supports:
+/// - Request/response RPC calls with optional timeouts
+/// - Persistent server subscriptions that survive reconnection
+/// - TLS with Trust On First Use (TOFU) certificate pinning
+/// - Traffic obfuscation through packet padding
+///
+///
+/// ## Thread Safety
+///
+/// All public functions are thread-safe and can be called from any queue. Internal
+/// synchronization is handled automatically.
 public final class ElectrumClient {
+    
+    // MARK: - Properties
+    
     #if DEBUG
-    // Logger is only used in DEBUG builds
+    /// Logger is only used in DEBUG builds
     private let logger: Logger = Logger(subsystem: "electrum", category: "client")
     #endif
-    
-    // Connection target
+
+    /// The remote hostname to connect to
     private let host: String
+    
+    /// The remote port to connect to.
     private let port: UInt16
+    
+    /// The configuration for this client
     private let config: ElectrumConfig
     
-    // Buffers and timers
+    /// A scheduled task to flush the send buffer after a delay
     private var sendTask: DispatchWorkItem? = nil
+    
+    /// The timestamp of the last send buffer flush
     private var sendLast: DispatchTime = .now()
     
+    /// Buffered outgoing data awaiting transmission
     private var sendBuffer: Data = Data()
-    /// - Important: Must ONLY be modified on the read queue.
+    
+    /// Buffered incoming data awaiting processing
     private var receiveBuffer: Data = Data()
     
-    // Request management
-    
+    /// The next request identifier to assign
     private var requestId: Int = 1
+    
+    /// Outstanding requests awaiting responses, keyed by request ID
     private var requests: [Int: NetworkRequest] = [:]
+    
+    /// Active subscriptions, keyed by a hash of the method and parameters
     private var subscriptions: [String: NetworkSubscription] = [:]
     
-    // Keychain queries for persisting pinned certificates and CA trust markers
+    /// Keychain query parameters for pinned certificates
     private let pinnedKeychainQuery: [String: Any]
+    
+    /// Keychain query parameters for CA trust markers
     private let caKeychainQuery: [String: Any]
-    
-    // Network connection and state
+
+    /// The underlying network connection
     private var connection: NWConnection?
-    private var connected: Bool = false
-    private var retries: Int = 0
     
-    // Internal queues
+    /// The network path monitor
+    private var monitor: NWPathMonitor?
+    
+    /// The last observed network path status
+    private var pathLast: NWPath.Status?
+    
+    /// The current connection status
+    private var status: ElectrumStatus = .disconnected
+    
+    /// The number of reconnection attempts made
+    private var reconnectAttempts: Int = 0
+    
+    /// A scheduled task to attempt reconnection
+    private var reconnectTask: DispatchWorkItem? = nil
+    
+    /// A scheduled timer for sending periodic ping messages
+    private var pingTask: DispatchSourceTimer? = nil
+
+    /// Queue for network operations and state management
     private let network: DispatchQueue
+    
+    /// Queue for processing received data
     private let read: DispatchQueue
+    
+    /// Queue for invoking completion handlers
     private let callback: DispatchQueue
     
     // MARK: - Internal helper types
     
+    /// The connection status of the client
+    private enum ElectrumStatus {
+        
+        /// The client has been explicitly stopped
+        case stopped
+        
+        /// The client is disconnected and not yet attempting to connect
+        case disconnected
+        
+        /// The client is attempting to establish a connection
+        case connecting
+        
+        /// The client has an active connection to the server
+        case connected
+    }
+    
+    /// Context for an active subscription
     private struct NetworkSubscription {
-        /// Handler invoked with the received data payloads for the subscription
+
+        /// The subscription method name
+        let method: String
+        
+        /// The parameters for the subscription
+        let params: [Any]
+        
+        /// The handler invoked when notifications are received
         let handler: ([Any]) -> Void
     }
     
+    /// Context for an outstanding request
     private struct NetworkRequest {
-        /// Completion used to return result to the caller
+        
+        /// The completion handler to invoke with the result
         let completion: (Result<Any, ElectrumError>) -> Void
-        /// Optional timer that triggers request timeout handling
+        
+        /// An optional timer that triggers timeout handling
         let timer: DispatchSourceTimer?
     }
     
+    /// Creates a new Electrum client
+    ///
+    /// - Parameters:
+    ///   - host: The remote hostname to connect to
+    ///   - port: The remote port to connect to
+    ///   - config: The client configuration
     public init(
         host: String,
         port: UInt16,
@@ -238,23 +486,26 @@ public final class ElectrumClient {
         self.port = port
         self.config = config
         
-        network = DispatchQueue(label: "\(host).main")
+        network = DispatchQueue(label: "\(host).network")
         read = DispatchQueue(label: "\(host).read")
         callback = DispatchQueue(label: "\(host).callback")
         
         // Base queries used for saving certificates + markers to the keychain
         caKeychainQuery = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "\(config.certPath).ca",
+            kSecAttrService as String: "\(config.tlsCertPath).ca",
             kSecAttrAccount as String: host
         ]
         pinnedKeychainQuery = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "\(config.certPath).pinned",
+            kSecAttrService as String: "\(config.tlsCertPath).pinned",
             kSecAttrAccount as String: host,
         ]
     }
     
+    /// Cleans up resources when the client is deallocated
+    ///
+    /// Ensures the connection is properly terminated and all resources are released.
     deinit {
         stop()
     }
@@ -263,8 +514,10 @@ public final class ElectrumClient {
     
     /// Starts the client and initiates a connection to the server
     ///
-    /// This function is safe to call from any queue; it dispatches internal work
-    /// onto the client's `main` queue.
+    /// This function is asynchronous and returns immediately. Connection state changes
+    /// can be observed through the lifecycle of individual requests and subscriptions.
+    ///
+    /// This function is safe to call from any queue.
     public func start() {
         network.async { [weak self] in
             self?.connect()
@@ -273,21 +526,28 @@ public final class ElectrumClient {
     
     /// Stops the client and gracefully terminates the connection
     ///
-    /// Cancelling the connection will also clear outstanding requests and
-    /// subscriptions
+    /// All outstanding requests will fail with ``ElectrumError/connectionClosed``.
+    /// Subscriptions will be removed and must be re-registered after a subsequent ``start()``.
+    ///
+    /// This method is safe to call from any queue.
     public func stop() {
         network.async { [weak self] in
             self?.disconnect()
         }
     }
     
-    /// Sends an RPC request to the server
+    /// Sends a JSON-RPC request to the server
     ///
     /// - Parameters:
-    ///   - method: Request method name
-    ///   - params: Array of string parameters for the request
-    ///   - timeout: Optional timeout in seconds for the request
-    ///   - completion: Completion invoked with the result or an `ElectrumError`
+    ///   - method: The remote method name to invoke
+    ///   - params: An array of parameters to pass to the method. Defaults to an empty array
+    ///   - timeout: An optional timeout interval in seconds. If the response is not received
+    ///              within this interval, completion is called with ``ElectrumError/requestTimeout``
+    ///   - completion: A completion handler called with the result of the request
+    ///
+    /// The completion handler is always invoked on an internal serial queue. If you need
+    /// to update UI or perform other main-thread work, dispatch to the main queue explicitly.
+    ///
     public func request(
         method: String,
         params: [Any] = [],
@@ -298,7 +558,7 @@ public final class ElectrumClient {
             guard let self = self else { return }
 
             // Ensure connection is open
-            guard self.connected else {
+            guard connection != nil else {
                 self.log("Request \"\(method)\" failed: connection closed")
                 self.callback.async {
                     completion(.failure(.connectionClosed))
@@ -363,14 +623,17 @@ public final class ElectrumClient {
         }
     }
     
-    /// Subscribes to server notifications for a given method and params
+    /// Subscribes to server notifications for a given method and parameters
     ///
     /// - Parameters:
-    ///   - method: Subscription method name
-    ///   - params: Array of string parameters for the subscription
-    ///   - handler: Handler invoked with subscription responses
+    ///   - method: The subscription method name
+    ///   - params: An array of parameters for the subscription. Defaults to an empty array
+    ///   - handler: A handler invoked each time a notification is received for this subscription
     ///
-    /// Subscriptions are stored locally and will be re-requested on reconnect.
+    /// Subscriptions persist across reconnections. When the connection is re-established,
+    /// the client automatically resubscribes to all registered subscriptions.
+    ///
+    /// The handler receives an array containing the notification data from the server.
     public func subscribe(
         method: String,
         params: [Any] = [],
@@ -387,29 +650,33 @@ public final class ElectrumClient {
             // Subscriptions can be keyed in without an active connection
             // All subscriptions will be re-established on reconnect
             self.subscriptions[key] = NetworkSubscription(
+                method: method,
+                params: params,
                 handler: handler
             )
-            guard self.connected else { return }
+            guard connection != nil, self.status == .connected else { return }
             
             self.request(
                 method: method,
                 params: params
-            ) { result in
+            ) { [weak self] result in
+                guard let self = self else { return }
                 switch result {
                 case .success(let data):
+                    self.log("Subscribed to (\(method), \(params))")
                     handler(params + [data])
-                case .failure:
-                    break
+                case .failure(let error):
+                    self.log("Subscription to (\(method), \(params)) failed: \(error)")
                 }
             }
         }
     }
     
-    /// Removes a previously-registered subscription
+    /// Removes a previously-registered subscription.
     ///
     /// - Parameters:
-    ///   - method: Subscription method name
-    ///   - params: Array of string parameters used
+    ///   - method: The subscription method name.
+    ///   - params: The array of parameters originally used to subscribe.
     public func unsubscribe(
         method: String,
         params: [Any] = []
@@ -426,11 +693,12 @@ public final class ElectrumClient {
     
     // MARK: - Packet handling
     
-    /// Enqueue an already-encoded packet for buffered sending
+    /// Enqueues an encoded packet for buffered transmission
     ///
-    /// This appends to the send buffer and attempts to flush immediately. If the
-    /// packet is too small (and force-send is not enabled), it will schedule a
-    /// delayed flush instead.
+    /// - Parameter packet: The packet data to enqueue
+    ///
+    /// This function appends the packet to the send buffer and attempts to flush immediately.
+    /// If conditions for sending are not met, a delayed flush is scheduled instead.
     private func enqueuePacket(_ packet: Data) {
         network.async { [weak self] in
             guard let self = self else { return }
@@ -447,11 +715,23 @@ public final class ElectrumClient {
     
     /// Attempts to flush the send buffer immediately
     ///
-    /// Returns `true` if data was sent (or at least the send was initiated),
-    /// `false` if no send occurred because conditions were not met.
+    /// - Returns: `true` if data was sent, `false` otherwise
+    ///
+    /// Data is sent only if:
+    /// - The buffer size exceeds ``ElectrumConfig/packetMinSize``
+    /// - The time elapsed since the last send is over ``ElectrumConfig/packetMinWait``
+    /// - The ``ElectrumConfig/packetForceSend`` flag is enabled
+    /// is enabled.
+    ///
+    /// The buffer is padded to the next power of two to help prevent basic traffic analysis.
+    /// This implements the same logic as Electrum's `PaddedRSTransport`.
     @discardableResult
     private func flushSend() -> Bool {
-        guard connected, !sendBuffer.isEmpty else {
+        guard
+            let connection = connection,
+            self.status == .connected,
+            !sendBuffer.isEmpty
+        else {
             return false
         }
         
@@ -518,7 +798,7 @@ public final class ElectrumClient {
             return (largePayloadSize, largePadSize)
         }()
         
-        // Subdata will crash if we don't guard the range
+        // .subdata() will crash if we don't guard the range
         guard
             packetSize >= 2,
             packetSize <= largePayloadSize,
@@ -547,7 +827,7 @@ public final class ElectrumClient {
         
         // Send and update buffer in completion
         // handler (back on the write queue)
-        connection?.send(
+        connection.send(
             content: out,
             completion: .contentProcessed({ [weak self] error in
                 if let error = error {
@@ -568,13 +848,12 @@ public final class ElectrumClient {
         return true
     }
    
-    /// Schedule a future attempt to call `flushSend()`
+    /// Schedules a delayed flush attempt
     ///
-    /// This function creates a `sendTask` to fire after the configured `packetMinWait`
-    /// to ensure small payloads are not indefinitely buffered.
+    /// Creates a dispatch work item that will call `flushSend()` after the remaining
+    /// wait time has elapsed.
     private func scheduleFlushSend() {
-        guard sendTask == nil
-        else { return }
+        guard sendTask == nil else { return }
         
         let remaining = max(0.0, config.packetMinWait - timeSinceFlushSend())
         
@@ -591,13 +870,15 @@ public final class ElectrumClient {
         )
     }
 
-    /// Cancels any scheduled send flush task
+    /// Cancels any scheduled flush task
     private func cancelFlushSend() {
         sendTask?.cancel()
         sendTask = nil
     }
     
-    /// Calculates the last time the send buffer was flushed
+    /// Returns the time interval since the last send buffer flush
+    ///
+    /// - Returns: The elapsed time in seconds
     private func timeSinceFlushSend() -> TimeInterval {
         let nanos = DispatchTime.now().uptimeNanoseconds &- sendLast.uptimeNanoseconds
         return Double(nanos) / Double(NSEC_PER_SEC)
@@ -605,11 +886,15 @@ public final class ElectrumClient {
     
     // MARK: - Helpers
     
-    /// Returns an opaque key for the given method + params that can be used to
-    /// uniquely identify subscriptions
+    /// Generates a unique key for a subscription based on its method and parameters
     ///
-    /// The key is an MD5 hex digest of `method + params.joined()`. MD5 is used
-    /// purely as a short, deterministic identifier, not for cryptographic purposes.
+    /// - Parameters:
+    ///   - method: The subscription method name
+    ///   - params: The subscription parameters
+    /// - Returns: A hexadecimal string representing the subscription key
+    ///
+    /// The key is an MD5 hash of the method and serialized parameters. MD5 is used
+    /// solely for its speed and deterministic output, not for cryptographic security.
     private func key(
         method: String,
         params: [Any] = []
@@ -626,12 +911,24 @@ public final class ElectrumClient {
     
     // MARK: - Connection Management
     
-    /// Sets up and starts the `NWConnection`
+    /// Establishes a connection to the server
     ///
-    /// This configures TLS options (including the minimum TLS version and a custom
-    /// verification block used for TOFU / pinned-certificate handling) and launches
-    /// the connection on the client's `main` queue.
+    /// Configures TLS with the minimum protocol version and custom certificate
+    /// verification using Trust On First Use (TOFU) logic.
     private func connect() {
+        guard
+            status != .connected,
+            status != .connecting
+        else { return }
+        
+        status = .connecting
+        
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        
+        connection?.cancel()
+        connection = nil
+        
         let options = NWProtocolTLS.Options()
         let secOptions = options.securityProtocolOptions
        
@@ -649,7 +946,6 @@ public final class ElectrumClient {
                     callback(false)
                     return
                 }
-                
                 self.verifyTLS(
                     metadata: metadata,
                     trust: trust,
@@ -665,25 +961,47 @@ public final class ElectrumClient {
             port: NWEndpoint.Port(rawValue: port)!
         )
 
-        connection = NWConnection(to: endpoint, using: parameters)
-        connection?.stateUpdateHandler = { [weak self] state in
+        let newConnection = NWConnection(to: endpoint, using: parameters)
+        newConnection.stateUpdateHandler = { [weak self] state in
             self?.handleStateUpdate(state)
         }
-        connection?.start(queue: network)
+        newConnection.start(queue: network)
+        connection = newConnection
         
-        log("Connection initiated")
+        let newMonitor = NWPathMonitor()
+        newMonitor.pathUpdateHandler = { [weak self] path in
+            self?.handlePathUpdate(path)
+        }
+        
+        newMonitor.start(queue: network)
+        monitor = newMonitor
+        
+        log("Connection initiating")
     }
     
-    /// Cancels the connection and resets state
+    /// Terminates the connection and cleans up resources
+    ///
+    /// All outstanding requests are failed with ``ElectrumError/connectionClosed``.
     private func disconnect() {
         connection?.cancel()
         connection = nil
         
+        monitor?.cancel()
+        monitor = nil
+        
         sendTask?.cancel()
         sendTask = nil
-
-        connected = false
         
+        pingTask?.cancel()
+        pingTask = nil
+        
+        reconnectTask?.cancel()
+        reconnectTask = nil
+
+        status = .stopped
+        reconnectAttempts = 0
+        
+        // Fail all outstanding requests
         for (_, request) in requests {
             request.timer?.cancel()
             callback.async {
@@ -697,10 +1015,9 @@ public final class ElectrumClient {
         log("Connection closed")
     }
     
-    /// Initiates continuous receiving of data from the server
+    /// Begins the receive loop to continuously read data from the server
     ///
-    /// Recursively calls itself to maintain an ongoing receive
-    /// loop. Data is read in chunks (up to 65536 bytes).
+    /// This function recursively calls itself to maintain an ongoing receive operation.
     private func startReceiving() {
         connection?.receive(
             minimumIncompleteLength: 1,
@@ -723,20 +1040,91 @@ public final class ElectrumClient {
         )
     }
     
+    /// Begins periodic ping messages to keep the connection alive
+    ///
+    /// This function creates a timer that periodically sends keepalive messages
+    /// to prevent idle connection timeouts.
     private func startPinging() {
+        pingTask?.cancel()
         
+        let task = DispatchSource.makeTimerSource(queue: network)
+        task.schedule(deadline: .now(), repeating: config.pingInterval)
+        task.setEventHandler { [weak self] in
+            // Ignore ping response, it's just NULL anyway
+            self?.request(method: "server.ping") { _ in }
+        }
+        task.resume()
+        
+        pingTask = task
     }
     
+    /// Resubscribes to all registered subscriptions after a reconnection
+    ///
+    /// When the connection is re-established, this function iterates through
+    /// all registered subscriptions and sends subscription requests to the server
+    /// to restore notification delivery.
     private func resubscribeAll() {
-        
+        for subscription in subscriptions.values {
+            request(
+                method: subscription.method,
+                params: subscription.params
+            ) { [weak self] result in
+                guard let self = self else { return }
+                
+                switch result {
+                case .success(let data):
+                    subscription.handler(subscription.params + [data])
+                    self.log("Resubscribed to (\(subscription.method), \(subscription.params))")
+                case .failure(let error):
+                    self.log("Resubscription to (\(subscription.method), \(subscription.params)) failed: \(error)")
+                    break
+                }
+            }
+        }
     }
     
-    // TODO: Handles updates to the connection state.
+    /// Schedules a delayed reconnection attempt
+    ///
+    /// Creates a dispatch work item that will call `connect()` after the remaining
+    /// wait time has elapsed.
+    ///
+    /// The delay uses exponential backoff starting at ``ElectrumConfig/reconnectDelay``
+    /// and multiplying by ``ElectrumConfig/reconnectMultiplier`` for each attempt, capped
+    /// at ``ElectrumConfig/reconnectMaxDelay``. Random jitter (``ElectrumConfig/reconnectJitter``)
+    /// is applied to prevent thundering herd problems.
+    private func scheduleReconnect() {
+        guard reconnectTask == nil, status == .disconnected else { return }
+        
+        let baseDelay = min(
+            config.reconnectDelay * pow(config.reconnectMultiplier, Double(reconnectAttempts)),
+            config.reconnectMaxDelay
+        )
+        
+        let jitter = baseDelay * config.reconnectJitter * Double.random(in: -1...1)
+        let delay = max(baseDelay, baseDelay + jitter)
+        
+        log("Scheduling reconnect in \(delay) seconds (attempt \(reconnectAttempts))")
+        reconnectAttempts += 1
+        
+        let task = DispatchWorkItem { [weak self] in
+            self?.connect()
+        }
+        
+        reconnectTask = task
+        network.asyncAfter(
+            deadline: .now() + delay,
+            execute: task
+        )
+    }
+    
+    /// Handles updates to the connection state
+    ///
+    /// - Parameter state: The new connection state
     private func handleStateUpdate(_ state: NWConnection.State) {
         switch state {
         case .ready:
-            connected = true
-            retries = 0
+            status = .connected
+            reconnectAttempts = 0
 
             startReceiving()
             startPinging()
@@ -745,19 +1133,52 @@ public final class ElectrumClient {
             log("Connection ready")
 
         case .failed(let error):
+            status = .disconnected
+            
+            pingTask?.cancel()
+            pingTask = nil
+            
+            scheduleReconnect()
+            
             log("Connection broken: \(error)")
-            connected = false
             
         case .cancelled:
+            status = .disconnected
+            
+            pingTask?.cancel()
+            pingTask = nil
+            
             log("Connection terminated")
-            connected = false
             
         default:
             break
         }
     }
     
-    /// Handles a request timeout firing for a previously-sent request
+    /// Handles updates to the network path
+    ///
+    /// - Parameter state: The new network path
+    private func handlePathUpdate(_ path: NWPath) {
+        guard path.status != pathLast else { return }
+        pathLast = path.status
+        
+        if path.status == .unsatisfied {
+            log("Network path broken")
+
+            connection?.cancel()
+            connection = nil
+            
+            reconnectTask?.cancel()
+            reconnectTask = nil
+        } else if path.status == .satisfied, status == .disconnected {
+            log("Network path established")
+            connect()
+        }
+    }
+    
+    /// Handles a request timeout for a previously-sent request
+    ///
+    /// - Parameter id: The request identifier
     private func handleRequestTimeout(_ id: Int) {
         guard let request = self.requests.removeValue(forKey: id)
         else { return }
@@ -768,38 +1189,63 @@ public final class ElectrumClient {
         }
     }
     
-    /// Appends newly-received raw bytes to the receive buffer and extracts
-    /// newline-terminated messages for processing
+    /// Appends newly-received data to the receive buffer and processes complete messages
     ///
-    /// Data slicing and decoding is performed on the `read` queue
+    /// - Parameter data: The received data chunk
+    ///
+    /// Messages are extracted by scanning for newline delimiters. Complete messages
+    /// are passed to `processResponse()` for decoding.
     private func handleReceivedData(_ data: Data) {
         read.async { [weak self] in
             guard let self = self else { return }
             
             self.receiveBuffer.append(data)
             
+            // Extract newline-delimited messages
             while let range = self.receiveBuffer.range(of: Data([newline])) {
                 let data = self.receiveBuffer.subdata(in: 0..<range.lowerBound)
                 self.receiveBuffer.removeSubrange(0...range.lowerBound)
                 
                 if !data.isEmpty {
-                    self.processResponse(data)
+                    self.processMessage(data)
                 }
             }
         }
     }
     
-    /// Decodes a single JSON-RPC response and dispatches the result to the
-    /// original request's completion handler (if the `id` matches)
-    private func processResponse(_ data: Data) {
-        guard
+    /// Decodes a JSON-RPC message and dispatches it to the appropriate handler
+    ///
+    /// - Parameter data: The raw JSON message data
+    ///
+    /// This function attempts to decode the data as either an `RPCResponse` (for request/response
+    /// messages) or an `RPCNotification` (for server-initiated notifications). If the message
+    /// is a response with a valid ID, it is passed to `handleResponse()`. If it is a notification,
+    /// it is passed to `handleNotification()`.
+    private func processMessage(_ data: Data) {
+        if
             let response = try? JSONDecoder().decode(RPCResponse.self, from: data),
             let id = response.id
-        else {
-            log("Failed to decode message: \(String(data: data, encoding: .utf8) ?? "invalid")")
+        {
+            handleResponse(id: id, response: response)
+            return
+        } else if
+            let notification = try? JSONDecoder().decode(RPCNotificaton.self, from: data)
+        {
+            handleNotification(notification)
             return
         }
         
+        log("Failed to decode message: \(String(data: data, encoding: .utf8) ?? "invalid")")
+    }
+    
+    /// Processes a JSON-RPC response and invokes the corresponding request handler
+    ///
+    /// - Parameters:
+    ///   - id: The request identifier from the original request
+    ///   - response: The decoded response object
+    ///
+    /// - Note: Responses for unknown request IDs are ignored.
+    private func handleResponse(id: Int, response: RPCResponse) {
         network.async { [weak self] in
             guard
                 let self = self,
@@ -825,22 +1271,52 @@ public final class ElectrumClient {
         }
     }
     
+    /// Processes a JSON-RPC notification and invokes the corresponding subscription handler
+    ///
+    /// - Parameter notification: The decoded notification object
+    ///
+    /// - Note: Notifications with invalid parameters or no matching subscription are ignored.
+    private func handleNotification(_ notification: RPCNotificaton) {
+        guard let data = notification.params.value as? [Any], !data.isEmpty else {
+            log("Invalid notification: \(notification)")
+            return
+        }
+        
+        let params = Array(data.dropLast())
+        let key = key(method: notification.method, params: params)
+        
+        network.async { [weak self] in
+            guard
+                let self = self,
+                let subscription = self.subscriptions[key]
+            else {
+                return
+            }
+            
+            callback.async {
+                subscription.handler(data)
+            }
+        }
+    }
+    
     // MARK: - TLS Verification
    
-    /// Verifies the TLS certificate using a TOFU (Trust On First Use) strategy
-    ///
-    ///  - If the server chain validates against system CAs and a CA trust marker
-    ///    is already saved for this host, the connection is accepted
-    ///  - If there is a saved pinned certificate for the host, the server's cert
-    ///    is compared with the pinned certificate bytes and validated against it
-    ///  - On first use:
-    ///     - If the server chain is trusted by the system, a CA trust marker is saved
-    ///     - If it is not trusted, the leaf certificate is pinned (saved)
+    /// Verifies the TLS certificate using Trust On First Use (TOFU) strategy.
     ///
     /// - Parameters:
-    ///   - metadata: `sec_protocol_metadata_t` provided by Network framework
-    ///   - trust: `sec_trust_t` representing the evaluated trust object
-    ///   - callback: Must be called with `true` to accept, `false` to reject
+    ///   - metadata: The TLS protocol metadata.
+    ///   - trust: The trust object to evaluate.
+    ///   - callback: A completion handler that must be called with `true` to accept
+    ///               the connection or `false` to reject it.
+    ///
+    /// This function implements a security model where:
+    /// 1. If the server's certificate chain validates against system CAs and a CA trust
+    ///    marker exists for this host, the connection is accepted.
+    /// 2. If a pinned certificate exists for this host, the server's certificate is
+    ///    compared against the pinned certificate.
+    /// 3. On first connection:
+    ///    - If the chain validates against system CAs, a CA trust marker is saved.
+    ///    - If CA validation fails, the leaf certificate is pinned for future connections.
     private func verifyTLS(
         metadata: sec_protocol_metadata_t,
         trust: sec_trust_t,
@@ -979,7 +1455,11 @@ public final class ElectrumClient {
     
     // MARK: - Debug
     
-    /// Internal debug logging helper (no-op in release builds)
+    /// Logs a debug message
+    ///
+    /// - Parameter message: The message to log
+    ///
+    /// Logging is only active in debug builds.
     private func log(_ message: String) {
         #if DEBUG
         logger.log(level: .debug, "[ElectrumClient] (\(self.host):\(self.port)) --- \(message, privacy: .public)")
