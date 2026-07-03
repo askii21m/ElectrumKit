@@ -455,7 +455,8 @@ public final class ElectrumClient: @unchecked Sendable {
     private var reconnectAttempts: Int = 0
 
     /// The number of consecutive keepalive ping failures
-    private var pingFailures: Int = 0
+    // internal (not private) so the keepalive liveness-reset is unit-testable.
+    var pingFailures: Int = 0
     
     /// A scheduled task to attempt reconnection
     private var reconnectTask: DispatchWorkItem? = nil
@@ -1309,7 +1310,11 @@ public final class ElectrumClient: @unchecked Sendable {
                     switch result {
                     case .success:
                         self.pingFailures = 0
-                    case .failure:
+                    case .failure(let error):
+                        // `.requestLimit` never touched the wire: the client is saturated with
+                        // in-flight requests, i.e. demonstrably BUSY, not dead. Counting it
+                        // toward death evidence bounced healthy connections under load.
+                        if case .requestLimit = error { return }
                         self.pingFailures += 1
                         if self.pingFailures >= 2 {
                             self.log("Keepalive failed twice; bouncing")
@@ -1602,13 +1607,17 @@ public final class ElectrumClient: @unchecked Sendable {
     /// - Note: Responses for unknown request IDs are ignored.
     private func handleResponse(id: Int, response: RPCResponse) {
         network.async { [weak self] in
-            guard
-                let self = self,
-                let request = self.requests.removeValue(forKey: id)
-            else {
-                return
-            }
-            
+            guard let self = self else { return }
+
+            // Any response from the server proves the connection is ALIVE. Without this,
+            // a sustained pipelined burst (a wallet's initial history scan) could starve the
+            // keepalive ping past its timeout twice in a row and bounce a healthy, merely-busy
+            // connection -- killing every in-flight request mid-scan. Liveness is any received
+            // message, not just ping responses (Electrum's own last-received-timestamp model).
+            self.pingFailures = 0
+
+            guard let request = self.requests.removeValue(forKey: id) else { return }
+
             request.timer?.cancel()
 
             config.callbackQueue.async {
@@ -1638,6 +1647,9 @@ public final class ElectrumClient: @unchecked Sendable {
 
         network.async { [weak self] in
             guard let self = self else { return }
+
+            // A server-initiated notification proves liveness exactly like a response does.
+            self.pingFailures = 0
 
             // Method-routed (e.g. Frigate silent payments): notifications carry by-name
             // object params that don't echo the subscribe request. Deliver the raw params.

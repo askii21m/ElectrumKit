@@ -67,6 +67,37 @@ final class RPCCodecTests: XCTestCase {
         XCTAssertEqual((history[1] as? [String: Any])?["height"] as? Int, 0) // mempool
     }
 
+    // KEEPALIVE LIVENESS: any received message proves the connection is alive. Without the
+    // reset, a sustained pipelined burst (a wallet's initial history scan) starved the ping
+    // past its 10s timeout twice in a row and `bounce()` killed a healthy, merely-busy
+    // connection mid-scan -- failing every in-flight request and turning a ~3s scan into ~50s
+    // of timeout-retry waves (observed live against Fulcrum 2.1.0).
+    func testReceivedNotificationResetsKeepaliveFailures() {
+        let client = ElectrumClient(host: "example.invalid", port: 50002)
+        client.pingFailures = 1   // one strike: the next failure would bounce
+
+        let received = XCTestExpectation(description: "notification delivered")
+        client.subscribe(toMethod: "blockchain.scripthash.subscribe") { _ in received.fulfill() }
+        let json = "{\"jsonrpc\":\"2.0\",\"method\":\"blockchain.scripthash.subscribe\",\"params\":[\"abcd\",\"s1\"]}"
+        client.processMessage(Data(json.utf8))
+        wait(for: [received], timeout: 2.0)
+
+        XCTAssertEqual(client.pingFailures, 0, "a live notification must clear keepalive strikes")
+    }
+
+    func testReceivedResponseResetsKeepaliveFailures() {
+        let client = ElectrumClient(host: "example.invalid", port: 50002)
+        client.pingFailures = 1
+
+        // Even a response to an id we no longer track proves the socket is alive.
+        client.processMessage(Data("{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":\"ok\"}".utf8))
+        let drained = XCTestExpectation(description: "network queue drained")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { drained.fulfill() }
+        wait(for: [drained], timeout: 2.0)
+
+        XCTAssertEqual(client.pingFailures, 0, "a live response must clear keepalive strikes")
+    }
+
     // Frigate attaches a NON-STANDARD `id` to its silent-payments notifications. Keying
     // off id-presence (the original bug) mis-routes them into the request/response path,
     // where they are dropped as a response to an unknown id. processMessage must route by
