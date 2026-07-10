@@ -447,6 +447,12 @@ public final class ElectrumClient: @unchecked Sendable {
     
     /// The last observed network path status
     private var pathLast: NWPath.Status?
+
+    /// The name of the path's preferred (first available) interface at the last update, so a
+    /// SAME-STATUS migration (a wifi -> cellular handover that never leaves `.satisfied`) is
+    /// visible: the socket was built while the old interface was preferred and is stranded on
+    /// it, and without this diff the only detector is the keepalive (two failed pings, 40-70s).
+    private var pathPrimaryInterfaceLast: String?
     
     /// The current connection status
     private var status: ElectrumStatus = .disconnected
@@ -806,6 +812,35 @@ public final class ElectrumClient: @unchecked Sendable {
                     handler(params + [data])
                 case .failure(let error):
                     self.log("Subscription to { \"\(method)\", \(params) } failed: \(error)")
+                    self.retrySubscribeRequest(method: method, params: params) { data in
+                        handler(params + [data])
+                    }
+                }
+            }
+        }
+    }
+
+    /// One delayed re-request for a failed (re)subscribe. The local entry exists but the server
+    /// was never told, so its notifications silently never arrive until the next reconnect's
+    /// `resubscribeAll` -- for a quiet foreground session that can be arbitrarily long. A second
+    /// failure defers to that reconnect and logs loud so the dead watch is diagnosable. A retry
+    /// racing a reconnect's own resubscribe just re-delivers the current result; downstream
+    /// status gating absorbs the duplicate.
+    private func retrySubscribeRequest(
+        method: String,
+        params: [Any],
+        onSuccess: ((Any) -> Void)? = nil
+    ) {
+        network.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self = self, self.status == .connected else { return }
+            self.request(method: method, params: params) { [weak self] result in
+                guard let self = self else { return }
+                switch result {
+                case .success(let data):
+                    self.log("Subscribe retry succeeded for { \"\(method)\", \(params) }")
+                    onSuccess?(data)
+                case .failure(let error):
+                    self.log("Subscribe retry FAILED for { \"\(method)\", \(params) }: \(error); dead until next reconnect")
                 }
             }
         }
@@ -847,6 +882,7 @@ public final class ElectrumClient: @unchecked Sendable {
                     self.log("Subscribed (by method) to \"\(method)\"")
                 case .failure(let error):
                     self.log("Subscription (by method) to \"\(method)\" failed: \(error)")
+                    self.retrySubscribeRequest(method: method, params: params)
                 }
             }
         }
@@ -1348,6 +1384,12 @@ public final class ElectrumClient: @unchecked Sendable {
                     self.log("Resubscribed to { \"\(subscription.method)\", \(subscription.params) }")
                 case .failure(let error):
                     self.log("Resubscription to { \"\(subscription.method)\", \(subscription.params) } failed: \(error)")
+                    self.retrySubscribeRequest(
+                        method: subscription.method,
+                        params: subscription.params
+                    ) { data in
+                        subscription.handler(subscription.params + [data])
+                    }
                 }
             }
         }
@@ -1364,6 +1406,10 @@ public final class ElectrumClient: @unchecked Sendable {
                     self.log("Resubscribed (by method) to \"\(methodSubscription.method)\"")
                 case .failure(let error):
                     self.log("Resubscription (by method) to \"\(methodSubscription.method)\" failed: \(error)")
+                    self.retrySubscribeRequest(
+                        method: methodSubscription.method,
+                        params: methodSubscription.params
+                    )
                 }
             }
         }
@@ -1473,10 +1519,61 @@ public final class ElectrumClient: @unchecked Sendable {
     /// Handles updates to the network path
     ///
     /// - Parameter state: The new network path
+    /// Whether a path update is a same-status interface MIGRATION: still `.satisfied`, but the
+    /// previously-preferred interface is gone from the available set (wifi died under a live
+    /// cellular fallback). An interface ADDITION (wifi joining while the old interface stays
+    /// available) is NOT a migration -- the existing socket remains valid on its interface.
+    /// Static + internal so the decision is unit-testable (NWPath is not constructible in tests).
+    static func isPathMigration(
+        status: NWPath.Status,
+        lastStatus: NWPath.Status?,
+        availableInterfaceNames: [String],
+        lastPrimaryInterfaceName: String?
+    ) -> Bool {
+        guard status == .satisfied, lastStatus == .satisfied,
+              let lastPrimary = lastPrimaryInterfaceName else { return false }
+        return !availableInterfaceNames.contains(lastPrimary)
+    }
+
     private func handlePathUpdate(_ path: NWPath) {
-        guard path.status != pathLast else { return }
+        let interfaceNames = path.availableInterfaces.map(\.name)
+        let migrated = Self.isPathMigration(
+            status: path.status,
+            lastStatus: pathLast,
+            availableInterfaceNames: interfaceNames,
+            lastPrimaryInterfaceName: pathPrimaryInterfaceLast
+        )
+        guard path.status != pathLast || migrated else {
+            // Same status, no migration: still track the preferred interface (a demotion --
+            // wifi joining over cellular -- must not bounce, but must update the baseline).
+            pathPrimaryInterfaceLast = path.availableInterfaces.first?.name ?? pathPrimaryInterfaceLast
+            return
+        }
         pathLast = path.status
-        
+        pathPrimaryInterfaceLast = path.availableInterfaces.first?.name
+
+        if migrated {
+            log("Network path migrated interfaces (now \(interfaceNames)); bouncing")
+            // Debounced like the satisfied-restore below: a handover can emit several updates
+            // in quick succession, and each bounce replays every subscription.
+            pathReconnectTask?.cancel()
+            let task = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                self.pathReconnectTask = nil
+                switch self.status {
+                case .connected, .connecting:
+                    self.bounce()
+                case .disconnected:
+                    self.connect()
+                case .stopped:
+                    break
+                }
+            }
+            pathReconnectTask = task
+            network.asyncAfter(deadline: .now() + pathReconnectDebounce, execute: task)
+            return
+        }
+
         if path.status == .unsatisfied {
             log("Network path broken")
 
